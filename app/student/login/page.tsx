@@ -213,7 +213,7 @@ export default function StudentLogin() {
                     type={showPassword ? 'text' : 'password'}
                     value={password}
                     onChange={(e) => setPassword(e.target.value)}
-                    placeholder={studentData?.password ? 'Enter password in dd/mm/yyyy' : 'Create a new password'}
+                    placeholder={studentData?.password ? 'Enter password' : 'Create a new password'}
                     className="input-field pl-10 pr-10"
                     required
                   />
