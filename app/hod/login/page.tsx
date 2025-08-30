@@ -2,11 +2,12 @@
 
 import { useState } from 'react'
 import { motion } from 'framer-motion'
-import { UserCheck, Mail, Lock, Eye, EyeOff, LogIn, ArrowLeft } from 'lucide-react'
+import { UserCheck, Mail, Lock, Eye, EyeOff, LogIn, ArrowLeft, KeyRound } from 'lucide-react'
 import { supabase } from '@/lib/supabase'
 import { useRouter } from 'next/navigation'
 import toast from 'react-hot-toast'
 import Link from 'next/link'
+import PasswordReset from '@/app/components/PasswordReset'
 
 export default function HODLogin() {
   const [email, setEmail] = useState('')
@@ -15,7 +16,7 @@ export default function HODLogin() {
   const [showPassword, setShowPassword] = useState(false)
   const [showConfirmPassword, setShowConfirmPassword] = useState(false)
   const [isLoading, setIsLoading] = useState(false)
-  const [step, setStep] = useState<'email' | 'password'>('email')
+  const [step, setStep] = useState<'email' | 'password' | 'reset'>('email')
   const [hodData, setHodData] = useState<any>(null)
   const router = useRouter()
 
@@ -280,6 +281,16 @@ export default function HODLogin() {
           {/* Footer */}
           <div className="mt-8 text-center space-y-3">
             <div>
+              <button
+                type="button"
+                onClick={() => setStep('reset')}
+                className="inline-flex items-center space-x-2 text-secondary-400 hover:text-secondary-300 text-sm transition-colors"
+              >
+                <KeyRound className="w-4 h-4" />
+                <span>Forgot Password?</span>
+              </button>
+            </div>
+            <div>
               <Link href="/" className="inline-flex items-center space-x-2 text-secondary-400 hover:text-secondary-300 text-sm transition-colors">
                 <ArrowLeft className="w-4 h-4" />
                 <span>Back to Home</span>
@@ -289,7 +300,17 @@ export default function HODLogin() {
         </div>
       </motion.div>
 
-
+      {/* Password Reset Modal */}
+      {step === 'reset' && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center p-4 z-50">
+          <div className="relative w-full max-w-md">
+            <PasswordReset 
+              role="hod" 
+              onBack={() => setStep('email')} 
+            />
+          </div>
+        </div>
+      )}
     </div>
   )
 }

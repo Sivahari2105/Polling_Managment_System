@@ -169,23 +169,78 @@ export default function HODDashboard() {
     }
   }, [selectedPoll])
 
-  const fetchDepartmentData = useCallback(async (hod: any) => {
+    const fetchDepartmentData = useCallback(async (hod: any) => {
     try {
       setLoadingProgress('Loading students...')
       
-      // Fetch all students in the department in one query
-      const { data: studentsData, error: studentsError } = await supabase
-        .from('students')
-        .select('*')
-        .eq('department', hod.department)
-        .order('section', { ascending: true })
-        .order('name', { ascending: true })
+      // Fetch all students in the department with pagination to ensure we get all students
+      let allStudents: Student[] = []
+      let from = 0
+      const pageSize = 1000
+      let retryCount = 0
+      const maxRetries = 3
       
-      if (studentsError) throw studentsError
+      while (true) {
+        try {
+          setLoadingProgress(`Loading students... (${allStudents.length} loaded so far)`)
+          
+          const { data: studentsData, error: studentsError } = await supabase
+            .from('students')
+            .select('*')
+            .eq('department', hod.department)
+            .order('section', { ascending: true })
+            .order('name', { ascending: true })
+            .range(from, from + pageSize - 1)
+          
+          if (studentsError) {
+            console.error('Error fetching students page:', studentsError)
+            if (retryCount < maxRetries) {
+              retryCount++
+              setLoadingProgress(`Retrying... (attempt ${retryCount}/${maxRetries})`)
+              await new Promise(resolve => setTimeout(resolve, 1000 * retryCount)) // Exponential backoff
+              continue
+            } else {
+              throw studentsError
+            }
+          }
+          
+          if (!studentsData || studentsData.length === 0) break
+          
+          allStudents = [...allStudents, ...studentsData]
+          from += pageSize
+          
+          // If we got less than pageSize, we've reached the end
+          if (studentsData.length < pageSize) break
+          
+          // Reset retry count on successful fetch
+          retryCount = 0
+          
+        } catch (error) {
+          console.error('Error in student fetch loop:', error)
+          if (retryCount < maxRetries) {
+            retryCount++
+            setLoadingProgress(`Retrying... (attempt ${retryCount}/${maxRetries})`)
+            await new Promise(resolve => setTimeout(resolve, 1000 * retryCount))
+            continue
+          } else {
+            throw error
+          }
+        }
+      }
       
-      setStudents(studentsData || [])
-      setLoadingProgress('Loading polls...')
-
+      setStudents(allStudents)
+      setLoadingProgress(`Loaded ${allStudents.length} students. Loading polls...`)
+      
+      // Debug logging
+      console.log(`HOD Dashboard: Loaded ${allStudents.length} students`)
+      console.log('Sections found:', Array.from(new Set(allStudents.map(s => s.section))).sort())
+      console.log('Section counts:', Object.fromEntries(
+        Array.from(new Set(allStudents.map(s => s.section))).sort().map(section => [
+          section, 
+          allStudents.filter(s => s.section === section).length
+        ])
+      ))
+      
       // Fetch all polls in the department
       const { data: classesData, error: classesError } = await supabase
         .from('classes')
@@ -225,10 +280,78 @@ export default function HODDashboard() {
       setLoadingProgress('Calculating statistics...')
 
       // Calculate section statistics
-      await calculateSectionStats(studentsData || [], formattedPolls)
+      await calculateSectionStats(allStudents, formattedPolls)
     } catch (error) {
-      console.error('Error fetching department data:', error)
-      toast.error('Failed to fetch department data')
+      console.error('Error fetching department data with pagination:', error)
+      
+      // Fallback: try to fetch all students at once with a higher limit
+      try {
+        setLoadingProgress('Pagination failed. Trying alternative method...')
+        console.log('Attempting fallback fetch method...')
+        
+        const { data: fallbackStudents, error: fallbackError } = await supabase
+          .from('students')
+          .select('*')
+          .eq('department', hod.department)
+          .order('section', { ascending: true })
+          .order('name', { ascending: true })
+          .limit(5000) // Try with a higher limit
+        
+        if (fallbackError) throw fallbackError
+        
+        if (fallbackStudents && fallbackStudents.length > 0) {
+          setStudents(fallbackStudents)
+          console.log(`Fallback method loaded ${fallbackStudents.length} students`)
+          setLoadingProgress(`Fallback loaded ${fallbackStudents.length} students. Loading polls...`)
+          
+          // Continue with polls loading using the existing logic
+          const { data: classesData, error: classesError } = await supabase
+            .from('classes')
+            .select('id')
+            .eq('department', hod.department)
+
+          if (classesError) throw classesError
+
+          const classIds = classesData.map(c => c.id)
+          
+          const { data: pollsData, error: pollsError } = await supabase
+            .from('polls')
+            .select(`
+              *,
+              staffs(name, id),
+              classes(department, section)
+            `)
+            .in('class_id', classIds)
+            .order('created_at', { ascending: false })
+
+          if (pollsError) throw pollsError
+
+          const formattedPolls = pollsData.map((poll: any) => ({
+            id: poll.id,
+            title: poll.title,
+            created_at: poll.created_at,
+            staff_name: poll.staffs?.name || 'Unknown',
+            staff_id: poll.staffs?.id || null,
+            class_name: `${poll.classes?.department} ${poll.classes?.section}`,
+            deadline: poll.deadline,
+            options: poll.options || [],
+            poll_type: poll.poll_type || 'options',
+            poll_category: poll.poll_category || 'General Poll'
+          }))
+
+          setPolls(formattedPolls)
+          setLoadingProgress('Calculating statistics...')
+
+          // Calculate section statistics
+          await calculateSectionStats(fallbackStudents, formattedPolls)
+        } else {
+          throw new Error('No students found with fallback method')
+        }
+      } catch (fallbackError) {
+        console.error('Fallback method also failed:', fallbackError)
+        toast.error('Failed to fetch department data. Please try refreshing.')
+        setStudents([])
+      }
     } finally {
       setIsLoading(false)
     }
@@ -256,13 +379,14 @@ export default function HODDashboard() {
     const sections = Array.from(new Set(students.map(s => s.section)))
     const stats: SectionStats[] = []
 
-    // Get all responses for all polls in one query instead of multiple queries
-    if (polls.length > 0) {
-      const pollIds = polls.map(p => p.id)
-      const { data: allResponses } = await supabase
-        .from('poll_responses')
-        .select('poll_id, student_reg_no')
-        .in('poll_id', pollIds)
+          // Get all responses for all polls in one query instead of multiple queries
+      if (polls.length > 0) {
+        const pollIds = polls.map(p => p.id)
+        const { data: allResponses } = await supabase
+          .from('poll_responses')
+          .select('poll_id, student_reg_no')
+          .in('poll_id', pollIds)
+          .limit(10000) // Increase limit to handle more responses
 
       // Calculate response rates for each section
       for (const section of sections) {
@@ -399,6 +523,7 @@ export default function HODDashboard() {
         .from('poll_responses')
         .select('*')
         .eq('poll_id', pollId)
+        .limit(10000) // Increase limit to handle more responses
 
       if (responsesError) throw responsesError
 
@@ -875,6 +1000,11 @@ export default function HODDashboard() {
                   <div className="mt-2 text-xs text-slate-400 opacity-0 group-hover:opacity-100 transition-opacity">
                     Click to refresh
                   </div>
+                  {/* Student Count Details */}
+                  <div className="mt-2 text-xs text-slate-400">
+                    <div>Expected: 1000+ students</div>
+                    <div>Loaded: {students.length} students</div>
+                  </div>
                 </div>
                 <div className="card text-center group cursor-pointer" onClick={handleRefresh}>
                   <div className="w-12 h-12 bg-accent-500/20 rounded-full flex items-center justify-center mx-auto mb-4 border border-accent-500/30 group-hover:bg-accent-500/30 transition-colors">
@@ -886,6 +1016,11 @@ export default function HODDashboard() {
                   <p className="text-slate-300">Total Sections</p>
                   <div className="mt-2 text-xs text-slate-400 opacity-0 group-hover:opacity-100 transition-opacity">
                     Click to refresh
+                  </div>
+                  {/* Section Count Details */}
+                  <div className="mt-2 text-xs text-slate-400">
+                    <div>Expected: 17 sections (A-Q)</div>
+                    <div>Found: {Array.from(new Set(students.map(s => s.section))).length} sections</div>
                   </div>
                 </div>
                 <div className="card text-center group cursor-pointer" onClick={handleRefresh}>
@@ -909,6 +1044,44 @@ export default function HODDashboard() {
                   <div className="mt-2 text-xs text-slate-400 opacity-0 group-hover:opacity-100 transition-opacity">
                     Click to refresh
                   </div>
+                </div>
+              </div>
+
+              {/* Section Breakdown Overview */}
+              <div className="card mb-6">
+                <div className="flex justify-between items-center mb-4">
+                  <h2 className="text-xl font-semibold text-white">Section Breakdown</h2>
+                  <div className="text-sm text-slate-400">
+                    Total: {students.length} students across {Array.from(new Set(students.map(s => s.section))).length} sections
+                  </div>
+                </div>
+                <div className="grid grid-cols-5 gap-2">
+                  {['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q'].map(expectedSection => {
+                    const sectionStudents = students.filter(s => s.section === expectedSection)
+                    const isPresent = sectionStudents.length > 0
+                    const count = sectionStudents.length
+                    
+                    return (
+                      <div
+                        key={expectedSection}
+                        className={`p-3 rounded-lg border text-center transition-all ${
+                          isPresent 
+                            ? 'bg-green-500/20 border-green-500/30 text-green-400' 
+                            : 'bg-red-500/20 border-red-500/30 text-red-400'
+                        }`}
+                      >
+                        <div className="text-lg font-bold">Section {expectedSection}</div>
+                        <div className="text-sm">
+                          {isPresent ? `${count} students` : 'Missing'}
+                        </div>
+                      </div>
+                    )
+                  })}
+                </div>
+                <div className="mt-4 p-3 bg-slate-700 rounded-lg">
+                  <p className="text-xs text-slate-400">
+                    <strong>Status:</strong> {Array.from(new Set(students.map(s => s.section))).length === 17 ? '✅ All sections present' : '⚠️ Some sections missing'}
+                  </p>
                 </div>
               </div>
 
@@ -957,6 +1130,33 @@ export default function HODDashboard() {
                     <span>View Detailed Analytics</span>
                   </button>
                 </div>
+                
+                {/* Debug Section */}
+                <div className="mt-4 p-4 bg-slate-800 rounded-lg border border-slate-600">
+                  <h4 className="text-sm font-medium text-white mb-2">Debug Information</h4>
+                  <div className="grid grid-cols-2 gap-4 text-xs">
+                    <div>
+                      <p className="text-slate-400">Students Loaded: <span className="text-white font-mono">{students.length}</span></p>
+                      <p className="text-slate-400">Sections Found: <span className="text-white font-mono">{Array.from(new Set(students.map(s => s.section))).length}</span></p>
+                      <p className="text-slate-400">Expected Sections: <span className="text-white font-mono">17 (A-Q)</span></p>
+                    </div>
+                    <div>
+                      <button
+                        onClick={() => {
+                          console.log('Debug refresh triggered')
+                          console.log('Current students count:', students.length)
+                          console.log('Current sections:', Array.from(new Set(students.map(s => s.section))).sort())
+                          handleRefresh()
+                        }}
+                        disabled={isRefreshing}
+                        className="w-full py-2 px-3 bg-slate-700 hover:bg-slate-600 text-slate-300 rounded text-xs"
+                        title="Refresh with console logging"
+                      >
+                        Debug Refresh
+                      </button>
+                    </div>
+                  </div>
+                </div>
               </div>
             </motion.div>
           )}
@@ -972,8 +1172,23 @@ export default function HODDashboard() {
                 <div>
                   <h2 className="text-2xl font-bold text-white">Department Students</h2>
                   <p className="text-sm text-slate-400 mt-1">
-                    Showing {students.length} students across all sections in {hodData.department} Department
+                    Showing {students.length} students across {Array.from(new Set(students.map(s => s.section))).length} sections in {hodData.department} Department
                   </p>
+                  {/* Student Count Summary */}
+                  <div className="mt-2 p-2 bg-slate-800 rounded border border-slate-600">
+                    <div className="text-xs text-slate-300">
+                      <span className="font-medium">Total Students:</span> {students.length} | 
+                      <span className="font-medium"> Sections Found:</span> {Array.from(new Set(students.map(s => s.section))).length}/17 | 
+                      <span className="font-medium"> Expected:</span> 1000+ students
+                    </div>
+                    {Array.from(new Set(students.map(s => s.section))).length < 17 && (
+                      <div className="text-xs text-amber-400 mt-1">
+                        ⚠️ Missing sections: {['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q']
+                          .filter(expected => !students.some(s => s.section === expected))
+                          .join(', ')}
+                      </div>
+                    )}
+                  </div>
                 </div>
                 <div className="flex items-center space-x-3">
                   <button
@@ -1058,6 +1273,18 @@ export default function HODDashboard() {
                         Sections: {Array.from(new Set(students.map(s => s.section))).sort().join(', ')} | 
                         Section Q: {students.filter(s => s.section === 'Q').length} students
                       </p>
+                      {/* Debug Information */}
+                      <div className="mt-2 p-2 bg-slate-800 rounded border border-slate-600">
+                        <p className="text-xs text-slate-300 font-mono">
+                          Debug: Found {Array.from(new Set(students.map(s => s.section))).length} unique sections
+                        </p>
+                        <p className="text-xs text-slate-300 font-mono">
+                          Sections: [{Array.from(new Set(students.map(s => s.section))).sort().join(', ')}]
+                        </p>
+                        <p className="text-xs text-slate-300 font-mono">
+                          Expected: A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q
+                        </p>
+                      </div>
                     </div>
                   </div>
 
